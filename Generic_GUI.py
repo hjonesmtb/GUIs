@@ -31,6 +31,8 @@ RECV_TIMEOUT_S  = 5.0    # per-query socket timeout
 # Live readback — one SFIFO? per cycle, values indexed by word position
 SFIFO_WD_QUERY = "SFIFO:WD?\r\n"
 SFIFO_QUERY = "SFIFO? \r\n"
+FIFO_WD_QUERY = "FIFO:WD?\r\n"
+FIFO_QUERY = "FIFO?\r\n"
 READBACK_FIELDS = [
     ("Val 1",  0),   # e.g. PID / alignment word
     ("Val 2",  3),   # e.g. avg_current
@@ -160,6 +162,17 @@ class IOThread(threading.Thread):
             sock.settimeout(old_timeout)
         return data.decode("ascii", errors="replace").strip()
 
+    def _query_fifo(self, sock):
+        wd_raw = self._query(sock, FIFO_WD_QUERY)
+        wd = int(wd_raw.splitlines()[0].strip(), 0)
+        if wd < 16384:
+            return None
+        values = []
+        for _ in range(8):
+            raw = self._query(sock, FIFO_QUERY)
+            values.extend(raw.split('\r\n')[0].split(','))
+        return values
+
     def run(self):
         # ── connect ──────────────────────────────────────────────────────────
         try:
@@ -181,13 +194,20 @@ class IOThread(threading.Thread):
                     if cmd is None:
                         break
                     try:
-                        sock.sendall(cmd.encode("ascii"))
-                        # Drain any immediate write response so later poll queries
-                        # see the expected query reply instead of stale command output.
-                        self._receive_line(sock, timeout=0.25)
-                        self._put("cmd_ack", cmd.strip())
+                        if isinstance(cmd, tuple) and cmd[0] == "fifo":
+                            values = self._query_fifo(sock)
+                            self._put("fifo", values)
+                        else:
+                            sock.sendall(cmd.encode("ascii"))
+                            # Drain any immediate write response so later poll queries
+                            # see the expected query reply instead of stale command output.
+                            self._receive_line(sock, timeout=0.25)
+                            self._put("cmd_ack", cmd.strip())
                     except Exception as exc:
-                        self._put("cmd_err", str(exc))
+                        if isinstance(cmd, tuple) and cmd[0] == "fifo":
+                            self._put("fifo_err", str(exc))
+                        else:
+                            self._put("cmd_err", str(exc))
                 except queue.Empty:
                     break
 
@@ -404,6 +424,11 @@ class ReadbackPanel(tk.LabelFrame):
             v.set("--")
 
 
+def _to_signed_16(value: str) -> int:
+    raw = int(value.strip(), 0) & 0xFFFF
+    return raw - 0x10000 if raw & 0x8000 else raw
+
+
 class RegisterPanel(tk.LabelFrame):
     def __init__(self, parent, queries: list, **kw):
         super().__init__(
@@ -436,6 +461,87 @@ class RegisterPanel(tk.LabelFrame):
     def clear_all(self):
         for bw in self._bit_widgets:
             bw.clear()
+
+
+class FIFOChartPanel(tk.LabelFrame):
+    def __init__(self, parent, **kw):
+        super().__init__(
+            parent, text=" FIFO Chart ", bg=PANEL_BG, fg=ACCENT,
+            font=FONT_TITLE, bd=1, relief="groove", **kw
+        )
+        self._values = []
+        self._status_var = tk.StringVar(value="No FIFO data")
+        self._canvas = tk.Canvas(
+            self, bg=ENTRY_BG, highlightthickness=0,
+            bd=0
+        )
+        self._canvas.pack(fill="both", expand=True, padx=10, pady=(10, 6))
+        self._status_label = tk.Label(
+            self, textvariable=self._status_var,
+            bg=PANEL_BG, fg=TEXT_DIM, font=FONT_SMALL,
+            wraplength=380, justify="left"
+        )
+        self._status_label.pack(fill="x", padx=10, pady=(0, 10))
+        self._canvas.bind("<Configure>", lambda ev: self._draw())
+
+    def update(self, raw_values):
+        if raw_values is None:
+            self._values = []
+            self._status_var.set("No FIFO data")
+            self._draw()
+            return
+        values = []
+        for raw in raw_values:
+            try:
+                values.append(_to_signed_16(raw))
+            except Exception:
+                pass
+        self._values = values
+        self._status_var.set(f"{len(values)} signed 16-bit values")
+        self._draw()
+
+    def clear(self):
+        self._values = []
+        self._status_var.set("No FIFO data")
+        self._draw()
+
+    def _draw(self):
+        self._canvas.delete("all")
+        width = self._canvas.winfo_width()
+        height = self._canvas.winfo_height()
+        if width <= 10 or height <= 10:
+            return
+        self._canvas.create_rectangle(0, 0, width, height, fill=ENTRY_BG, outline="")
+        if not self._values:
+            self._canvas.create_text(
+                width // 2, height // 2,
+                text="No FIFO values to plot", fill=TEXT_DIM,
+                font=FONT_SMALL
+            )
+            return
+        min_val = min(self._values)
+        max_val = max(self._values)
+        if min_val == max_val:
+            min_val -= 1
+            max_val += 1
+        x0, y0 = 40, 20
+        x1, y1 = width - 10, height - 30
+        self._canvas.create_rectangle(x0, y0, x1, y1, outline=TEXT_DIM)
+        self._canvas.create_text(x0 + 4, y0 + 8, text=str(max_val), anchor="w", fill=TEXT_DIM, font=FONT_SMALL)
+        self._canvas.create_text(x0 + 4, y1 - 8, text=str(min_val), anchor="w", fill=TEXT_DIM, font=FONT_SMALL)
+        plot_width = max(1, x1 - x0)
+        plot_height = max(1, y1 - y0)
+        step = max(1, len(self._values) // plot_width)
+        sampled = self._values[::step]
+        if len(sampled) < 2:
+            sampled = self._values
+        coords = []
+        for idx, value in enumerate(sampled):
+            x = x0 + idx * (plot_width / (len(sampled) - 1)) if len(sampled) > 1 else x0
+            y = y1 - ((value - min_val) / (max_val - min_val)) * plot_height
+            coords.extend((x, y))
+        self._canvas.create_line(*coords, fill=ACCENT, width=1.5, smooth=True)
+        self._canvas.create_text(x1, y1 + 12, text=f"{len(self._values)} pts", anchor="e", fill=TEXT_DIM, font=FONT_SMALL)
 
 
 class CommandPanel(tk.LabelFrame):
@@ -525,6 +631,54 @@ class CommandPanel(tk.LabelFrame):
         self._status_var.set(f"✖  {msg}")
 
 
+class CustomCommandPanel(tk.LabelFrame):
+    def __init__(self, parent, **kw):
+        super().__init__(
+            parent, text=" Custom Command ", bg=PANEL_BG, fg=ACCENT,
+            font=FONT_TITLE, bd=1, relief="groove", **kw
+        )
+        self._cmd_queue = None
+
+        styled_label(self, "Command:", bg=PANEL_BG).grid(row=0, column=0, padx=(10, 6), pady=(10, 6), sticky="e")
+        self._entry = styled_entry(self, width=30)
+        self._entry.grid(row=0, column=1, padx=(0, 8), pady=(10, 6))
+
+        self._send_btn = tk.Button(
+            self, text="Send", width=6,
+            bg=ACCENT, fg="#000000", activebackground="#00b894",
+            font=FONT_LABEL, relief="flat", cursor="hand2",
+            command=self._send
+        )
+        self._send_btn.grid(row=0, column=2, padx=(0, 10), pady=(10, 6))
+
+        self._status_var = tk.StringVar(value="")
+        tk.Label(
+            self, textvariable=self._status_var,
+            bg=PANEL_BG, fg=TEXT_DIM, font=FONT_SMALL
+        ).grid(row=1, column=0, columnspan=3, padx=10, pady=(0, 10))
+
+    def set_queue(self, q):
+        self._cmd_queue = q
+
+    def _send(self):
+        if self._cmd_queue is None:
+            self._status_var.set("⚠  Not connected")
+            return
+        cmd = self._entry.get().strip()
+        if not cmd:
+            return
+        if not cmd.endswith('\r\n'):
+            cmd += '\r\n'
+        self._cmd_queue.put(cmd)
+        self._status_var.set(f"→  {cmd.strip()}")
+
+    def on_ack(self, cmd: str):
+        self._status_var.set(f"✔  {cmd}")
+
+    def on_err(self, msg: str):
+        self._status_var.set(f"✖  {msg}")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN APPLICATION
 # ─────────────────────────────────────────────────────────────────────────────
@@ -556,6 +710,7 @@ class App(tk.Tk):
         body.columnconfigure(0, weight=1)
         body.columnconfigure(1, weight=1)
         body.rowconfigure(1, weight=1)
+        body.rowconfigure(2, weight=0)
 
         self.readback_panel = ReadbackPanel(body, READBACK_FIELDS)
         self.readback_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=(0, 12))
@@ -566,20 +721,65 @@ class App(tk.Tk):
         self.command_panel = CommandPanel(body, COMMANDS)
         self.command_panel.grid(row=1, column=0, sticky="nsew", padx=(0, 8), pady=(0, 8))
 
+        fifo_container = tk.LabelFrame(
+            body, text=" FIFO Fetch ", bg=PANEL_BG, fg=ACCENT,
+            font=FONT_TITLE, bd=1, relief="groove"
+        )
+        fifo_container.grid(row=1, column=1, sticky="nsew", padx=(8, 0), pady=(0, 8))
+
+        self.fifo_status_var = tk.StringVar(value="FIFO idle")
+        self.fifo_button = tk.Button(
+            fifo_container,
+            text="Query FIFO",
+            command=self._on_fifo_button,
+            bg=ENTRY_BG, fg=ACCENT,
+            activebackground=ACCENT, activeforeground="#000",
+            font=FONT_LABEL, relief="flat", cursor="hand2",
+            padx=10, pady=6
+        )
+        self.fifo_button.pack(padx=10, pady=(10, 8))
+
+        tk.Label(
+            fifo_container,
+            textvariable=self.fifo_status_var,
+            bg=PANEL_BG, fg=TEXT_DIM,
+            font=FONT_SMALL, wraplength=260, justify="left"
+        ).pack(fill="x", padx=10, pady=(0, 10))
+
+        self.fifo_chart = FIFOChartPanel(fifo_container)
+        self.fifo_chart.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        self.fifo_button.config(state="disabled")
+
+        self.custom_panel = CustomCommandPanel(body)
+        self.custom_panel.grid(row=2, column=0, columnspan=2, sticky="ew", padx=0, pady=(8, 0))
+
     def _start_io(self, ip: str, port: int):
         if self._io and self._io.is_alive():
             self._io.stop()
         self._io = IOThread(ip, port, COMMANDS, COMMAND_QUERIES)
         self._io.start()
+        self.command_panel.set_queue(self._io.cmd_queue)
+        self.custom_panel.set_queue(self._io.cmd_queue)
+
+    def _on_fifo_button(self):
+        if not self._io or not self._io.is_alive():
+            self.fifo_status_var.set("Not connected")
+            return
+        self._io.cmd_queue.put(("fifo",))
+        self.fifo_status_var.set("Querying FIFO…")
 
     def _stop_io(self):
         if self._io:
             self._io.stop()
             self._io = None
         self.command_panel.set_queue(None)
+        self.custom_panel.set_queue(None)
         self.command_panel.clear_current_values()
         self.readback_panel.clear()
         self.register_panel.clear_all()
+        self.fifo_button.config(state="disabled")
+        self.fifo_status_var.set("FIFO idle")
+        self.fifo_chart.clear()
         self.conn_panel.on_disconnected()
 
     def _poll_results(self):
@@ -594,9 +794,13 @@ class App(tk.Tk):
                         if val == "connected":
                             self.conn_panel.on_connected()
                             self.command_panel.set_queue(self._io.cmd_queue)
+                            self.custom_panel.set_queue(self._io.cmd_queue)
+                            self.fifo_button.config(state="normal")
                         elif val == "disconnected":
                             self.conn_panel.on_disconnected()
                             self.command_panel.set_queue(None)
+                            self.custom_panel.set_queue(None)
+                            self.fifo_button.config(state="disabled")
                             self.readback_panel.clear()
                             self.register_panel.clear_all()
                         elif val.startswith("error:"):
@@ -609,10 +813,22 @@ class App(tk.Tk):
                         self.register_panel.update(msg[1], msg[2])
                     elif kind == "cmd_val":
                         self.command_panel.update_current(msg[1], msg[2])
+                    elif kind == "fifo":
+                        if msg[1] is None:
+                            self.fifo_status_var.set("FIFO count != 16384, no fetch performed")
+                            self.fifo_chart.clear()
+                        else:
+                            self.fifo_status_var.set(f"FIFO fetched {len(msg[1])} values")
+                            self.fifo_chart.update(msg[1])
+                    elif kind == "fifo_err":
+                        self.fifo_status_var.set(f"FIFO error: {msg[1]}")
+
                     elif kind == "cmd_ack":
                         self.command_panel.on_ack(msg[1])
+                        self.custom_panel.on_ack(msg[1])
                     elif kind == "cmd_err":
                         self.command_panel.on_err(msg[1])
+                        self.custom_panel.on_err(msg[1])
             except queue.Empty:
                 pass
         self.after(50, self._poll_results)
